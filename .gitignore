@@ -1,0 +1,115 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+*.dll
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+*.log
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# virtualenv
+# 如果你的虚拟环境目录名称不是 venv，请修改这里
+venv/
+env/
+.venv/
+
+# Environments
+.env
+*.env
+.flaskenv
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre-check
+.pyre/
+
+# ruff
+.ruff_cache/
+
+# Docker
+.dockerignore
+Dockerfile.prod.backup # 例如，某个备份的 Dockerfile
+docker-compose.yml.backup # 例如，某个备份的 docker-compose 文件
+
+# Specific IDEs and editors
+.idea/                          # JetBrains IDEs (PyCharm, IntelliJ)
+.vscode/                        # VS Code
+*.sublime-project
+*.sublime-workspace
+.DS_Store                       # macOS
+Thumbs.db                       # Windows
+Desktop.ini                     # Windows
+
+# Misc
+.history/                       # VS Code History extension
+*.swp                           # vim swap files
+*.bak                           # Backup files
+*.tmp                           # Temporary files
+*.sqlite3                       # Common SQLite database files (e.g., Django's default)
+*.db                            # Generic database files
+
+# Custom additions (add your project-specific ignores here)
+# For example, if you have a data/ folder that contains large, generated data:
+# data/
+
+# If you use a tool like poetry or pipenv, their lock files are usually
+# recommended to be committed for reproducibility.
+# But if you choose to ignore them:
+# poetry.lock
+# Pipfile.lock
+# uv.lock
+
+workspace/
