@@ -7,9 +7,9 @@ import soundfile as sf
 import torch
 import numpy as np
 from pyannote.audio import Pipeline
-from kokoro import KPipeline
+from kokoro import KModel, KPipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from typing import Optional, NamedTuple, Dict, Literal
+from typing import Optional, NamedTuple, Dict, Literal, List, Tuple
 
 
 class Vad:
@@ -28,10 +28,10 @@ class Vad:
 
 
 class S2T:
-    def __init__(self, model_id='openai/whisper-large-v3-turbo', sample_rate=16000):
+    def __init__(self, model_id, samplerate, device):
         self.model_id = model_id
-        self.sample_rate = sample_rate
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.sample_rate = samplerate
+        self.device = device
         self.torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         self.model = AutoModelForSpeechSeq2Seq.from_pretrained(
             model_id, torch_dtype=self.torch_dtype, low_cpu_mem_usage=True, use_safetensors=True,
@@ -47,14 +47,71 @@ class S2T:
             truncation=False,
             return_attention_mask=True,
         ).to(self.device, dtype=self.torch_dtype)
-        lang_ids = self.model.detect_language(inputs.input_features)
-        if lang_ids[0] != 50259 and lang_ids[0] != 50260:  # 50259: <|en|>, 50260: <|zh|>
-            print(f'detected unknown language: {lang_ids}, {self.processor.decode(lang_ids)}')
+        lang_code, lang_prob = self.detect_language(inputs.input_features, ['en', 'zh'], 0.5)
+        if lang_code is None:
             return None
         gen_kwargs = {}
         pred_ids = self.model.generate(**inputs, **gen_kwargs)
         pred_text = self.processor.batch_decode(pred_ids, skip_special_tokens=True, decode_with_timestamps=False)
-        return dict(text=pred_text[0], lang='en' if lang_ids[0] == 50259 else 'zh')
+        return dict(text=pred_text[0], lang=lang_code, prob=lang_prob)
+
+    def detect_language(self, input_features, lang_codes: List[str], threshold: float = 0) -> Tuple[Optional[str], float]:
+        req_lang_ids = [self.model.generation_config.lang_to_id[f'<|{lang_code}|>'] for lang_code in lang_codes]
+        decoder_input_ids = (
+            torch.ones((input_features.shape[0], 1), device=self.device, dtype=torch.long)
+            * self.model.generation_config.decoder_start_token_id
+        )
+        with torch.no_grad():
+            logits = self.model(input_features, decoder_input_ids=decoder_input_ids, use_cache=False).logits[:, -1]
+        non_lang_mask = torch.ones_like(logits[0], dtype=torch.bool)
+        non_lang_mask[list(self.model.generation_config.lang_to_id.values())] = False
+        logits[:, non_lang_mask] = -np.inf
+        probs = torch.softmax(logits, dim=-1)
+        predicted_lang_id, predicted_lang_prob = probs.argmax(-1)[0], probs.max(-1)[0].item()
+        if predicted_lang_id in req_lang_ids:
+            predicted_lang_code = lang_codes[req_lang_ids.index(predicted_lang_id)]
+            if predicted_lang_prob > threshold:
+                return predicted_lang_code, predicted_lang_prob
+            else:
+                print(f'detected language {predicted_lang_code} with low probability {predicted_lang_prob}')
+        else:
+            print(f'detected invalid language: {self.processor.decode(predicted_lang_id)}')
+        return None, predicted_lang_prob
+
+
+class TTS:
+    def __init__(self, model_id, samplerate, device):
+        self.model_id = model_id
+        self.sample_rate = samplerate
+        self.device = device
+        assert self.sample_rate == 24000
+        en_pipeline = KPipeline(lang_code='a', repo_id=self.model_id, model=False)
+
+        def en_callable(text):
+            if text == 'Kokoro':
+                return 'kˈOkəɹO'
+            elif text == 'Sol':
+                return 'sˈOl'
+            return next(en_pipeline(text)).phonemes
+
+        model = KModel(repo_id=self.model_id).to(self.device).eval()
+        self.pipeline = KPipeline(lang_code='z', repo_id=self.model_id, model=model, en_callable=en_callable)
+
+    def generate_speech(self, text: str) -> Optional[torch.FloatTensor]:
+        # HACK: Mitigate rushing caused by lack of training data beyond ~100 tokens
+        # Simple piecewise linear fn that decreases speed as len_ps increases
+        def speed_callable(len_ps):
+            speed = 0.8
+            if len_ps <= 83:
+                speed = 1
+            elif len_ps < 183:
+                speed = 1 - (len_ps - 83) / 500
+            return speed * 1.1
+
+        generator = self.pipeline(text, voice='zf_001', speed=speed_callable)
+        result = next(generator)
+        print(f'generated speech phonemes: {result.phonemes}')
+        return result.audio
 
 
 class AudioPlayer:
@@ -78,7 +135,8 @@ class AudioPlayer:
         self.stream.close()
 
     def play(self, audio_array):
-        """ audio_array is a numpy array of shape (n, 1) """
+        """ audio_array is a numpy array of shape (n, channels) """
+        assert audio_array.shape[1] == self.channels
         for idx in range((audio_array.shape[0] + self.block_size - 1) // self.block_size):
             msg = self.Msg(audio_array, idx)
             self.playing_audio_q.put(msg)
@@ -110,9 +168,10 @@ class AudioPlayer:
 
 
 class AudioProcessor:
-    def __init__(self, vad: Vad, s2t: S2T, player: AudioPlayer):
+    def __init__(self, vad: Vad, s2t: S2T, tts: TTS, player: AudioPlayer):
         self.vad = vad
         self.s2t = s2t
+        self.tts = tts
         self.player = player
         self.last_block_idx = 0
         self.vad_active_idx = None
@@ -131,14 +190,20 @@ class AudioProcessor:
             self.vad_active_idx = self.last_block_idx
         elif self.vad_active_idx is not None:
             assert self.audio_buffer is not None
-            # append one more block
-            self.audio_buffer = np.concatenate([self.audio_buffer, audio_array])
+            # do not append one more block for latency reduction
+            # self.audio_buffer = np.concatenate([self.audio_buffer, audio_array])
             result = self.s2t.transcribe(self.audio_buffer)
             if result is not None:
-                print(f'[{self.vad_active_idx}-{self.last_block_idx}] transcribing {result["text"]} ({result["lang"]})')
-                if result["lang"] == 'zh':
-                    self.player.stop()
-                    self.player.play(self.audio_buffer.reshape(-1, 1))
+                print(f'[{self.vad_active_idx}-{self.last_block_idx}] transcribing {result["text"]} ({result["lang"]}, {result["prob"]:.2f})')
+                # audio echo test
+                # if result["lang"] == 'zh':
+                #     self.player.stop()
+                #     self.player.play(self.audio_buffer.reshape(-1, 1))
+                speech = self.tts.generate_speech(result["text"])
+                if speech is not None:
+                    self.player.play(speech.reshape(-1, 1))
+                else:
+                    print(f'speech generation failed')
             self.audio_buffer = None
             self.vad_active_idx = None
         self.prev_audio_array = audio_array
@@ -170,19 +235,23 @@ def recording_loop(duration, samplerate, callback=None):
 
 
 class Config(NamedTuple):
-    sample_rate: int = 16000
-    recording_block_duration: float = 0.5
-    playing_block_duration: float = 0.5
+    recording_sample_rate: int = 16000
+    recording_block_duration: float = 0.25
+    playing_sample_rate: int = 24000
+    playing_block_duration: float = 0.25
+    device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     running_cache_dir: str = '/dev/shm'
     s2t_model_id: str = 'openai/whisper-large-v3-turbo'
+    tts_model_id: str = 'hexgrad/Kokoro-82M-v1.1-zh'
 
 
 if __name__ == '__main__':
     print('Initializing ...', flush=True)
     cfg = Config()
     vad = Vad(cfg.running_cache_dir)
-    s2t = S2T(cfg.s2t_model_id, cfg.sample_rate)
-    player = AudioPlayer(cfg.playing_block_duration, cfg.sample_rate)
-    processor = AudioProcessor(vad, s2t, player)
+    s2t = S2T(cfg.s2t_model_id, cfg.recording_sample_rate, cfg.device)
+    tts = TTS(cfg.tts_model_id, cfg.playing_sample_rate, cfg.device)
+    audio_player = AudioPlayer(cfg.playing_block_duration, cfg.playing_sample_rate)
+    audio_processor = AudioProcessor(vad, s2t, tts, audio_player)
     print('========== start recording ==========', flush=True)
-    recording_loop(cfg.recording_block_duration, cfg.sample_rate, callback=processor.process)
+    recording_loop(cfg.recording_block_duration, cfg.recording_sample_rate, callback=audio_processor.process)
