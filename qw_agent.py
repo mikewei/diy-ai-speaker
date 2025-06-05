@@ -10,6 +10,7 @@ import uvicorn
 from typing import List
 from datetime import datetime
 
+
 @register_tool('get_datetime')
 class GetDatetime(BaseTool):
     description = 'Get the current date, time and weekday.'
@@ -17,6 +18,7 @@ class GetDatetime(BaseTool):
 
     def call(self, _params: str, **kwargs) -> str:
         return datetime.now().strftime('%Y-%m-%d %H:%M:%S %A')
+
 
 @register_tool('my_image_gen')
 class MyImageGen(BaseTool):
@@ -63,20 +65,31 @@ llm_cfg = {
 # Please show the image using `plt.show()`.'''
 system_instruction = '''
 You are a helpful assistant that can answer questions and help with tasks. 
-If the question is simple, please think fast and short.
+
+# Global Behavior Guidelines
+
+- Do not call functions (<tool_call>) between <think> and </think> tags, call functions only after </think> tag.
+- My name is 小金刚.
+- If user's question is simple, please think fast and short.
+
+# Current Task Instructions (Optional)
 '''
+
 tools = [
     'get_datetime',
     'my_image_gen',
     'code_interpreter',  # `code_interpreter` is a built-in tool for executing code.
 ]
+
 files = [
-    '/home/mikewei/data/datasets/mikewei/basic_facts.md'
+    '/home/mikewei/data/datasets/mikewei/basic_facts_2.md'
 ]
+
 bot = Assistant(llm=llm_cfg,
                 system_message=system_instruction,
                 function_list=tools,  # type: ignore
                 files=files)
+
 
 if __name__ == "__main__":
     messages = []  # This stores the chat history.
@@ -98,6 +111,7 @@ if __name__ == "__main__":
         print(f'len of response: {len(response)}')
         for msg in response:
             print(msg)
+
 
 # 创建FastAPI应用
 app = FastAPI(title="Smart Agent API")
@@ -134,6 +148,7 @@ def extract_prefix_thinking(msg_content: str) -> tuple[str, str]:
     if msg_content.startswith('<think>'):
         msg_content = msg_content[7:]
     think_end = msg_content.find('</think>')
+    # todo: when </think> tag missing, how to return?
     if think_end != -1:
         reasoning = msg_content[:think_end].lstrip()
         msg_content = msg_content[think_end + 8:].lstrip()
@@ -142,6 +157,7 @@ def extract_prefix_thinking(msg_content: str) -> tuple[str, str]:
 @app.post("/v1/chat/completions", response_model=ChatResponse)
 async def chat_completion(request: ChatRequest):
     try:
+        # todo: optimize the log format
         print(f"get request: {request}")    
         messages = [msg.model_dump() for msg in request.messages]
         response_content = ""

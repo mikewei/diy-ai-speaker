@@ -1,3 +1,5 @@
+from typing import Optional, NamedTuple, Dict, Literal, List, Tuple
+from abc import ABC, abstractmethod
 import os
 import time
 import queue
@@ -6,10 +8,10 @@ import sounddevice as sd
 import soundfile as sf
 import torch
 import numpy as np
+import openai
 from pyannote.audio import Pipeline
 from kokoro import KModel, KPipeline
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
-from typing import Optional, NamedTuple, Dict, Literal, List, Tuple
 
 
 class Vad:
@@ -47,7 +49,7 @@ class S2T:
             truncation=False,
             return_attention_mask=True,
         ).to(self.device, dtype=self.torch_dtype)
-        lang_code, lang_prob = self.detect_language(inputs.input_features, ['en', 'zh'], 0.5)
+        lang_code, lang_prob = self.detect_language(inputs.input_features, ['en', 'zh'], 0.7)
         if lang_code is None:
             return None
         gen_kwargs = {}
@@ -108,12 +110,61 @@ class TTS:
                 speed = 1 - (len_ps - 83) / 500
             return speed * 1.1
 
+        # todo: when text is too long, the generator will truncate the speech
         generator = self.pipeline(text, voice='zf_001', speed=speed_callable)
         result = next(generator)
         print(f'generated speech phonemes: {result.phonemes}')
         return result.audio
 
 
+class TextSpeaker(ABC):
+    @abstractmethod
+    def response(self, text: str):
+        ...
+
+    @abstractmethod
+    def last_active_time(self):
+        ...
+
+
+class TextProcessor(ABC):
+    @abstractmethod
+    def request(self, text: str, speaker: TextSpeaker):
+        ...
+
+
+class EchoTextProcessor(TextProcessor):
+    def request(self, text: str, speaker: TextSpeaker):
+        speaker.response(text)
+
+
+class ChatClient:
+    def __init__(self, api_key: str, base_url: str, model: str):
+        self.client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    def chat(self, messages: List[Dict]):
+        return self.client.chat.completions.create(model="qwen3-14b-diy", messages=messages)   # type: ignore
+
+
+class SimpleChatProcessor(TextProcessor):
+    def __init__(self, chat_client: ChatClient):
+        self.chat_client = chat_client
+
+    def request(self, text: str, speaker: TextSpeaker):
+        try:
+            response = self.chat_client.chat([
+                {"role": "system", "content": "You are chatting with a user named Max."},
+                {"role": "user", "content": text}
+            ])
+        except Exception as e:
+            print(f'chat failed: {e} for "{text}"')
+            return
+        if response.choices[0].message.content is not None:
+            speaker.response(response.choices[0].message.content)
+        else:
+            print(f'chat response is None for "{text}"')
+
+    
 class AudioPlayer:
     class Msg(NamedTuple):
         audio_array: np.ndarray
@@ -167,12 +218,13 @@ class AudioPlayer:
             outdata.fill(0)
 
 
-class AudioProcessor:
-    def __init__(self, vad: Vad, s2t: S2T, tts: TTS, player: AudioPlayer):
+class AudioProcessor(TextSpeaker):
+    def __init__(self, vad: Vad, s2t: S2T, tts: TTS, player: AudioPlayer, processor: TextProcessor):
         self.vad = vad
         self.s2t = s2t
         self.tts = tts
         self.player = player
+        self.processor = processor
         self.last_block_idx = 0
         self.vad_active_idx = None
         self.audio_buffer = None
@@ -188,6 +240,7 @@ class AudioProcessor:
             else:
                 self.audio_buffer = np.concatenate([self.audio_buffer, audio_array])
             self.vad_active_idx = self.last_block_idx
+            self.vad_active_time = time.time()
         elif self.vad_active_idx is not None:
             assert self.audio_buffer is not None
             # do not append one more block for latency reduction
@@ -199,15 +252,26 @@ class AudioProcessor:
                 # if result["lang"] == 'zh':
                 #     self.player.stop()
                 #     self.player.play(self.audio_buffer.reshape(-1, 1))
-                speech = self.tts.generate_speech(result["text"])
-                if speech is not None:
-                    self.player.play(speech.reshape(-1, 1))
-                else:
-                    print(f'speech generation failed')
+                self.processor.request(result["text"], self)
+                # speech = self.tts.generate_speech(result["text"])
+                # if speech is not None:
+                #     self.player.play(speech.reshape(-1, 1))
+                # else:
+                #     print(f'speech generation failed')
             self.audio_buffer = None
             self.vad_active_idx = None
         self.prev_audio_array = audio_array
         self.last_block_idx += 1
+
+    def response(self, text: str):
+        speech = self.tts.generate_speech(text)
+        if speech is not None:
+            self.player.play(speech.reshape(-1, 1))
+        else:
+            print(f'speech generation failed for "{text}"')
+
+    def last_active_time(self) -> float:
+        return self.vad_active_time
 
 
 def recording_loop(duration, samplerate, callback=None):
@@ -243,6 +307,9 @@ class Config(NamedTuple):
     running_cache_dir: str = '/dev/shm'
     s2t_model_id: str = 'openai/whisper-large-v3-turbo'
     tts_model_id: str = 'hexgrad/Kokoro-82M-v1.1-zh'
+    chat_api_key: str = 'dummy-key'
+    chat_base_url: str = 'http://localhost:8008/v1'
+    chat_model: str = 'qwen3-14b-diy'
 
 
 if __name__ == '__main__':
@@ -251,7 +318,9 @@ if __name__ == '__main__':
     vad = Vad(cfg.running_cache_dir)
     s2t = S2T(cfg.s2t_model_id, cfg.recording_sample_rate, cfg.device)
     tts = TTS(cfg.tts_model_id, cfg.playing_sample_rate, cfg.device)
+    chat_client = ChatClient(cfg.chat_api_key, cfg.chat_base_url, cfg.chat_model)
+    text_processor = SimpleChatProcessor(chat_client)
     audio_player = AudioPlayer(cfg.playing_block_duration, cfg.playing_sample_rate)
-    audio_processor = AudioProcessor(vad, s2t, tts, audio_player)
+    audio_processor = AudioProcessor(vad, s2t, tts, audio_player, text_processor)
     print('========== start recording ==========', flush=True)
     recording_loop(cfg.recording_block_duration, cfg.recording_sample_rate, callback=audio_processor.process)
