@@ -1,8 +1,9 @@
-from typing import Optional, NamedTuple, Dict, Literal, List, Tuple
+from typing import Iterable, Optional, NamedTuple, Dict, Literal, List, Tuple, Iterator
 from abc import ABC, abstractmethod
 import os
 import time
 import queue
+import itertools
 import threading
 import sounddevice as sd
 import soundfile as sf
@@ -99,7 +100,7 @@ class TTS:
         model = KModel(repo_id=self.model_id).to(self.device).eval()
         self.pipeline = KPipeline(lang_code='z', repo_id=self.model_id, model=model, en_callable=en_callable)
 
-    def generate_speech(self, text: str) -> Optional[torch.FloatTensor]:
+    def generate_speech(self, text: str) -> Iterator[torch.FloatTensor]:
         # HACK: Mitigate rushing caused by lack of training data beyond ~100 tokens
         # Simple piecewise linear fn that decreases speed as len_ps increases
         def speed_callable(len_ps):
@@ -110,11 +111,13 @@ class TTS:
                 speed = 1 - (len_ps - 83) / 500
             return speed * 1.1
 
+        def transform_result(result):
+            print(f'generated speech phonemes: {result.phonemes}')
+            return result.audio.reshape(-1, 1)
+
         # todo: when text is too long, the generator will truncate the speech
         generator = self.pipeline(text, voice='zf_001', speed=speed_callable)
-        result = next(generator)
-        print(f'generated speech phonemes: {result.phonemes}')
-        return result.audio
+        return map(transform_result, generator)
 
 
 class TextSpeaker(ABC):
@@ -147,22 +150,61 @@ class ChatClient:
 
 
 class SimpleChatProcessor(TextProcessor):
-    def __init__(self, chat_client: ChatClient):
+    class HistoryMsgs(NamedTuple):
+        timestamp: float
+        messages: List[Dict]
+        tokens: int
+
+    def __init__(self, chat_client: ChatClient, max_input_tokens: int, max_context_secs: int):
         self.chat_client = chat_client
+        self.max_input_tokens = max_input_tokens
+        self.max_context_secs = max_context_secs
+        self.history: List[SimpleChatProcessor.HistoryMsgs] = []
+        self.sys_prompt = '\n'.join([
+            "- You are now a voice assistant, use short oral language to answer the user's question.",
+            "- You are chatting with a user named Max.",
+        ])
+        self.sys_message = [{"role": "system", "content": self.sys_prompt}]
+        self.sys_message_tokens = self.calc_tokens(self.sys_message)
 
     def request(self, text: str, speaker: TextSpeaker):
         try:
-            response = self.chat_client.chat([
-                {"role": "system", "content": "You are chatting with a user named Max."},
-                {"role": "user", "content": text}
-            ])
+            user_message = [{"role": "user", "content": text}]
+            history_messages = self.get_history_messages()
+            input_messages = self.sys_message + history_messages + user_message
+            print(f'chat input:\n{input_messages}')
+            response = self.chat_client.chat(input_messages)
+            self.history.append(self.HistoryMsgs(time.time(), user_message, self.calc_tokens(user_message)))
         except Exception as e:
-            print(f'chat failed: {e} for "{text}"')
+            print(f'chat failed: {e}')
             return
-        if response.choices[0].message.content is not None:
-            speaker.response(response.choices[0].message.content)
+        output_message = response.choices[0].message
+        print(f'chat output:\n{output_message}')
+        if output_message.content is not None:
+            speaker.response(output_message.content)
+            assistant_message = [{'role': output_message.role, 'content': output_message.content}]
+            self.history.append(self.HistoryMsgs(time.time(), assistant_message, self.calc_tokens(assistant_message)))
         else:
-            print(f'chat response is None for "{text}"')
+            print(f'chat response is None')
+
+    def get_history_messages(self) -> List[Dict]:
+        result_pos = len(self.history)
+        left_tokens: int = self.max_input_tokens - self.sys_message_tokens
+        for i in range(len(self.history)-1, -1, -1):
+            left_tokens -= self.history[i].tokens
+            if left_tokens < self.sys_message_tokens:
+                break
+            if self.history[i].timestamp < time.time() - self.max_context_secs:
+                break
+            # the first message following the system message must be a user message
+            if self.history[i].messages[0]['role'] == 'user':
+                result_pos = i
+        self.history = self.history[result_pos:]
+        return list(itertools.chain.from_iterable(msgs.messages for msgs in self.history))
+
+    def calc_tokens(self, messages: List[Dict]) -> int:
+        """ a naive implementation of counting tokens """
+        return sum(len(message['content'].split()) + 2 for message in messages)
 
     
 class AudioPlayer:
@@ -185,9 +227,11 @@ class AudioPlayer:
         self.stream.stop()
         self.stream.close()
 
-    def play(self, audio_array):
+    def play(self, audio_array, reset=False):
         """ audio_array is a numpy array of shape (n, channels) """
         assert audio_array.shape[1] == self.channels
+        if reset:
+            self.stop()
         for idx in range((audio_array.shape[0] + self.block_size - 1) // self.block_size):
             msg = self.Msg(audio_array, idx)
             self.playing_audio_q.put(msg)
@@ -205,7 +249,7 @@ class AudioPlayer:
                 msg = self.playing_audio_q.get_nowait()
             left_block_size = int(msg.audio_array.shape[0]) - int(msg.block_idx * self.block_size)
             assert left_block_size > 0
-            print(f'start playing block {msg.block_idx}')
+            # print(f'start playing block {msg.block_idx}')
             # padding
             if left_block_size < self.block_size:
                 block = msg.audio_array[msg.block_idx * self.block_size :]
@@ -234,9 +278,9 @@ class AudioProcessor(TextSpeaker):
         """ audio_array is a numpy array of shape (n) """
         detected_audio = audio_array if self.prev_audio_array is None else np.concatenate([self.prev_audio_array, audio_array])
         if self.vad.detect(detected_audio):
-            print(f'[{self.last_block_idx}] vad detected')
             if self.audio_buffer is None:
                 self.audio_buffer = audio_array if self.prev_audio_array is None else np.concatenate([self.prev_audio_array, audio_array])
+                print('vad detected, start recording ...')
             else:
                 self.audio_buffer = np.concatenate([self.audio_buffer, audio_array])
             self.vad_active_idx = self.last_block_idx
@@ -252,23 +296,27 @@ class AudioProcessor(TextSpeaker):
                 # if result["lang"] == 'zh':
                 #     self.player.stop()
                 #     self.player.play(self.audio_buffer.reshape(-1, 1))
-                self.processor.request(result["text"], self)
+                # tts echo test
                 # speech = self.tts.generate_speech(result["text"])
                 # if speech is not None:
                 #     self.player.play(speech.reshape(-1, 1))
                 # else:
                 #     print(f'speech generation failed')
+                # let's do chat
+                self.processor.request(result["text"], self)
             self.audio_buffer = None
             self.vad_active_idx = None
         self.prev_audio_array = audio_array
         self.last_block_idx += 1
 
     def response(self, text: str):
-        speech = self.tts.generate_speech(text)
-        if speech is not None:
-            self.player.play(speech.reshape(-1, 1))
-        else:
-            print(f'speech generation failed for "{text}"')
+        speech_gen = self.tts.generate_speech(text)
+        first_speech = True
+        for speech in speech_gen:
+            self.player.play(speech, reset=first_speech)
+            if first_speech:
+                print(f'playing speech ... ')
+            first_speech = False
 
     def last_active_time(self) -> float:
         return self.vad_active_time
@@ -300,7 +348,7 @@ def recording_loop(duration, samplerate, callback=None):
 
 class Config(NamedTuple):
     recording_sample_rate: int = 16000
-    recording_block_duration: float = 0.25
+    recording_block_duration: float = 0.5
     playing_sample_rate: int = 24000
     playing_block_duration: float = 0.25
     device: str = 'cuda:0' if torch.cuda.is_available() else 'cpu'
@@ -310,6 +358,8 @@ class Config(NamedTuple):
     chat_api_key: str = 'dummy-key'
     chat_base_url: str = 'http://localhost:8008/v1'
     chat_model: str = 'qwen3-14b-diy'
+    chat_max_input_tokens: int = 2000
+    chat_max_context_secs: int = 300
 
 
 if __name__ == '__main__':
@@ -319,7 +369,7 @@ if __name__ == '__main__':
     s2t = S2T(cfg.s2t_model_id, cfg.recording_sample_rate, cfg.device)
     tts = TTS(cfg.tts_model_id, cfg.playing_sample_rate, cfg.device)
     chat_client = ChatClient(cfg.chat_api_key, cfg.chat_base_url, cfg.chat_model)
-    text_processor = SimpleChatProcessor(chat_client)
+    text_processor = SimpleChatProcessor(chat_client, cfg.chat_max_input_tokens, cfg.chat_max_context_secs)
     audio_player = AudioPlayer(cfg.playing_block_duration, cfg.playing_sample_rate)
     audio_processor = AudioProcessor(vad, s2t, tts, audio_player, text_processor)
     print('========== start recording ==========', flush=True)
