@@ -113,3 +113,4 @@ Desktop.ini                     # Windows
 # uv.lock
 
 workspace/
+.python-version

@@ -1,0 +1,33 @@
+[project]
+name = "diy-ai-speaker"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.2.1",
+    "dotenv>=0.9.9",
+    "fastapi>=0.115.13",
+    "json5>=0.12.0",
+    "kokoro>=0.9.4",
+    "misaki[zh]>=0.9.4",
+    "pip>=25.1.1",
+    "pyannote-audio>=3.3.2",
+    "pydantic>=2.11.7",
+    "python-dateutil>=2.9.0.post0",
+    "qwen-agent[code-interpreter,mcp,rag]>=0.0.27",
+    "sounddevice>=0.5.2",
+    "soundfile>=0.13.1",
+    "uvicorn>=0.34.3",
+    "vllm>=0.9.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/diy_ai_agent", "src/diy_ai_speaker"]

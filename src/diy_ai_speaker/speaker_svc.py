@@ -50,7 +50,7 @@ class S2T:
             truncation=False,
             return_attention_mask=True,
         ).to(self.device, dtype=self.torch_dtype)
-        lang_code, lang_prob = self.detect_language(inputs.input_features, ['en', 'zh'], 0.7)
+        lang_code, lang_prob = self.detect_language(inputs.input_features, ['en', 'zh'], [0.88, 0.66])
         if lang_code is None:
             return None
         gen_kwargs = {}
@@ -58,7 +58,7 @@ class S2T:
         pred_text = self.processor.batch_decode(pred_ids, skip_special_tokens=True, decode_with_timestamps=False)
         return dict(text=pred_text[0], lang=lang_code, prob=lang_prob)
 
-    def detect_language(self, input_features, lang_codes: List[str], threshold: float = 0) -> Tuple[Optional[str], float]:
+    def detect_language(self, input_features, lang_codes: List[str], threshold: List[float]) -> Tuple[Optional[str], float]:
         req_lang_ids = [self.model.generation_config.lang_to_id[f'<|{lang_code}|>'] for lang_code in lang_codes]
         decoder_input_ids = (
             torch.ones((input_features.shape[0], 1), device=self.device, dtype=torch.long)
@@ -72,8 +72,9 @@ class S2T:
         probs = torch.softmax(logits, dim=-1)
         predicted_lang_id, predicted_lang_prob = probs.argmax(-1)[0], probs.max(-1)[0].item()
         if predicted_lang_id in req_lang_ids:
-            predicted_lang_code = lang_codes[req_lang_ids.index(predicted_lang_id)]
-            if predicted_lang_prob > threshold:
+            req_index = req_lang_ids.index(predicted_lang_id)
+            predicted_lang_code = lang_codes[req_index]
+            if predicted_lang_prob > threshold[req_index]:
                 return predicted_lang_code, predicted_lang_prob
             else:
                 print(f'detected language {predicted_lang_code} with low probability {predicted_lang_prob}')
@@ -162,7 +163,7 @@ class SimpleChatProcessor(TextProcessor):
         self.history: List[SimpleChatProcessor.HistoryMsgs] = []
         self.sys_prompt = '\n'.join([
             "- You are now a voice assistant, use short oral language to answer the user's question.",
-            "- You are chatting with a user named Max.",
+            "- You are chatting with a user named Mike.",
         ])
         self.sys_message = [{"role": "system", "content": self.sys_prompt}]
         self.sys_message_tokens = self.calc_tokens(self.sys_message)
@@ -362,7 +363,7 @@ class Config(NamedTuple):
     chat_max_context_secs: int = 300
 
 
-if __name__ == '__main__':
+def main():
     print('Initializing ...', flush=True)
     cfg = Config()
     vad = Vad(cfg.running_cache_dir)
@@ -374,3 +375,6 @@ if __name__ == '__main__':
     audio_processor = AudioProcessor(vad, s2t, tts, audio_player, text_processor)
     print('========== start recording ==========', flush=True)
     recording_loop(cfg.recording_block_duration, cfg.recording_sample_rate, callback=audio_processor.process)
+
+if __name__ == '__main__':
+    main()

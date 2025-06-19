@@ -82,7 +82,7 @@ tools = [
 ]
 
 files = [
-    '/home/mikewei/data/datasets/mikewei/basic_facts_2.md'
+    '/home/mikewei/data/datasets/mikewei/basic_facts_3.md'
 ]
 
 bot = Assistant(llm=llm_cfg,
