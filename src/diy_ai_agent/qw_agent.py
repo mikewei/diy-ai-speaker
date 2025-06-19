@@ -79,6 +79,18 @@ tools = [
     'get_datetime',
     'my_image_gen',
     'code_interpreter',  # `code_interpreter` is a built-in tool for executing code.
+    {
+        'mcpServers': {
+            "whiteboard-mcp": {
+                "command": "npx",
+                "args": [
+                    "mcp-remote",
+                    "http://192.168.0.110:5000/mcp/sse",
+                    "--allow-http"
+                ]
+            }
+        }
+    }
 ]
 
 files = [
